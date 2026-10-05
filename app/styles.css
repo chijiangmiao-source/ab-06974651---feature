@@ -170,3 +170,122 @@ td small { color: var(--dim); }
 .chip.inv { border-color: var(--warn); }
 .chip.grant { border-color: var(--ok); }
 .chip em { color: var(--warn); font-style: normal; }
+
+button.chip { cursor: pointer; font-family: ui-monospace, Consolas, monospace; text-align: left; }
+button.chip.chainpick:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---------- 因果链回溯 ---------- */
+
+.trace-row { align-items: center; }
+.trace-row label { color: var(--dim); font-size: 12.5px; }
+.trace-row select {
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font: 12px ui-monospace, Consolas, monospace;
+  min-width: 260px;
+  max-width: 46vw;
+}
+
+#chainView { margin-top: 6px; }
+
+.chain-head {
+  font-weight: 600;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+.chain-head.bad { border-color: var(--bad); color: #ffd7da; }
+
+.chain-relation {
+  border: 1px dashed var(--accent);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  font-size: 12.5px;
+  background: rgba(90, 162, 255, 0.08);
+}
+.chain-relation.match { border-style: solid; border-color: var(--ok); background: rgba(67, 209, 158, 0.08); }
+.chain-relation.no-pending,
+.chain-relation.gen-mismatch,
+.chain-relation.not-waiting,
+.chain-relation.no-owed-ack {
+  border-color: var(--bad);
+  background: rgba(255, 95, 107, 0.08);
+}
+.chain-relation small { color: var(--dim); }
+
+ol.chain { list-style: none; margin: 0; padding: 0; }
+
+.chain-ring {
+  position: relative;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 0 0 8px 14px;
+  background: var(--panel2);
+  cursor: pointer;
+}
+.chain-ring::before {
+  content: "↓";
+  position: absolute;
+  left: -16px;
+  bottom: -13px;
+  color: var(--dim);
+}
+.chain-ring:last-child::before { content: ""; }
+.chain-ring:hover { border-color: var(--accent); }
+
+.chain-ring.role-origin { border-left-color: var(--ok); }
+.chain-ring.role-retransmit { border-left-color: var(--warn); }
+.chain-ring.role-ack { border-left-color: #b58cff; }
+.chain-ring.role-deliver-dup { border-left-style: dashed; }
+.chain-ring.peer { opacity: 0.75; }
+.chain-ring.peer:hover { opacity: 1; }
+.chain-ring.historical { border-left-color: var(--dim); opacity: 0.8; }
+.chain-ring.selected { outline: 2px solid var(--accent); }
+.chain-ring.viol { border-color: var(--bad); border-left-color: var(--bad); }
+
+.ring-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.ring-step { font-family: ui-monospace, Consolas, monospace; font-weight: 700; color: var(--accent); }
+.ring-role { font-weight: 600; }
+.ring-tags { color: var(--warn); font-size: 11.5px; font-family: ui-monospace, Consolas, monospace; }
+.chain-ring.viol .ring-tags { color: var(--bad); }
+
+.ring-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 4px 0;
+  font: 12px ui-monospace, Consolas, monospace;
+  color: var(--dim);
+}
+.ring-action { font-size: 12.5px; }
+.ring-extra { font-size: 12px; color: var(--dim); margin-top: 3px; }
+
+.ring-reject {
+  margin-top: 6px;
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  background: rgba(255, 95, 107, 0.12);
+  color: #ffd7da;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.chain-end {
+  margin-top: 4px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--ok);
+  background: rgba(67, 209, 158, 0.08);
+  font-size: 12.5px;
+}
+.chain-end.bad { border-color: var(--bad); background: rgba(255, 95, 107, 0.1); color: #ffd7da; }
+
+.chain-error { color: var(--bad); }

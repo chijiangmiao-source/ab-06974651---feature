@@ -403,6 +403,498 @@
     return null;
   }
 
+  // ---------- 因果链回溯 ----------
+  //
+  // 审查员从一条在途消息（或一条确认）出发，回看其产生与后续作用。
+  // 链路完全由 simulate() 已固定的逐步证据派生，不重新执行协议，因此：
+  //   - 重传副本经 dupOf 回到唯一原始消息，超时环只记录“复制”，不伪造来源；
+  //   - 重复投递环通过 replayOf 指向最早生效的那次既有投递动作；
+  //   - 迟到确认 / 导致冻结的消息，链路止于首个违约步并附拒绝原因；
+  //   - 迟到确认同时给出其缺失或失配的等待关系（当前等待集合 + 旧轮闭合证据）。
+
+  const CHAIN_ROLE_LABELS = Object.freeze({
+    origin: '原始请求',
+    retransmit: '超时重传',
+    deliver: '投递·生效动作',
+    'deliver-dup': '重复投递·回放既有动作',
+    ack: '确认',
+  });
+
+  function buildTraceIndex(result) {
+    const steps = result.steps;
+    const messages = new Map(); // id -> { id, kind, to, line, gen, dupOf, createdAt }
+    for (let i = 1; i < steps.length; i++) {
+      const prev = new Set(steps[i - 1].inFlight.map((m) => m.id));
+      for (const m of steps[i].inFlight) {
+        if (!prev.has(m.id) && !messages.has(m.id)) {
+          messages.set(m.id, {
+            id: m.id, kind: m.kind, to: m.to, line: m.line, gen: m.gen,
+            dupOf: m.dupOf, createdAt: i,
+          });
+        }
+      }
+    }
+    const deliveries = new Map(); // 消息号 -> 投递事件步（含失败投递）
+    const acks = [];
+    for (let i = 1; i < steps.length; i++) {
+      const ev = steps[i].event;
+      if (!ev) continue;
+      if (ev.type === 'deliver') {
+        const list = deliveries.get(ev.msg) || [];
+        list.push(i);
+        deliveries.set(ev.msg, list);
+      } else if (ev.type === 'ack') {
+        acks.push({ step: i, core: ev.core, line: ev.line, gen: ev.gen });
+      }
+    }
+    // 每轮失效：写升级步、世代、该轮发出的全部失效消息
+    const writeUpgrades = [];
+    for (let i = 1; i < steps.length; i++) {
+      const ev = steps[i].event;
+      if (ev && ev.type === 'write_upgrade') {
+        const gen = steps[i].dir[ev.line].gen;
+        const invIds = [...messages.values()]
+          .filter((m) => m.kind === 'inv' && m.createdAt === i && m.line === ev.line)
+          .map((m) => m.id)
+          .sort((a, b) => a - b);
+        writeUpgrades.push({ step: i, core: ev.core, line: ev.line, gen, invIds });
+      }
+    }
+    // 某线某世代写入的闭合步与最后一击确认者
+    function closureOf(line, gen) {
+      for (let i = 1; i < steps.length; i++) {
+        const pre = steps[i - 1].dir[line].pending;
+        const post = steps[i].dir[line].pending;
+        if (pre && pre.gen === gen && post === null) {
+          const ev = steps[i].event;
+          return { step: i, closedBy: ev && ev.type === 'ack' ? ev.core : null };
+        }
+      }
+      return null;
+    }
+    return { steps, messages, deliveries, acks, writeUpgrades, closureOf };
+  }
+
+  // 沿 dupOf 回到原始消息编号
+  function rootIdOf(index, msgId) {
+    const seen = new Set();
+    let cur = msgId;
+    while (cur != null && !seen.has(cur)) {
+      seen.add(cur);
+      const m = index.messages.get(cur);
+      if (!m || m.dupOf === null) return cur;
+      cur = m.dupOf;
+    }
+    return cur;
+  }
+
+  // 同一条消息的完整重传家族：[原始, 副本1, 副本2, …]（按编号）
+  function familyOf(index, msgId) {
+    const root = rootIdOf(index, msgId);
+    const ids = [root];
+    for (const m of index.messages.values()) {
+      if (m.id !== root && rootIdOf(index, m.id) === root) ids.push(m.id);
+    }
+    ids.sort((a, b) => a - b);
+    return ids;
+  }
+
+  function ring(r) {
+    return Object.assign({
+      step: null, role: null, peer: false, historical: false, selected: false,
+      msgId: null, line: null, core: null, gen: null,
+      action: '', dupOf: null, replayOf: null, closes: false,
+      alsoCreated: [], violation: null,
+    }, r);
+  }
+
+  function vioAt(index, step) {
+    const v = step ? index.steps[step].violation : null;
+    return v ? { kind: v.kind, label: VIOLATION_LABELS[v.kind] || v.kind, detail: v.detail, step: v.step } : null;
+  }
+
+  // 一条失效/授权消息的全部重传环与投递环（按步序）
+  function lineageRings(index, lineage, opts) {
+    const out = [];
+    // 超时重传环：除原始消息外，每个副本都有其 timeout 产生步
+    for (const id of lineage.slice(1)) {
+      const m = index.messages.get(id);
+      const parent = index.messages.get(m.dupOf);
+      out.push(ring({
+        step: m.createdAt, role: 'retransmit', msgId: id,
+        line: m.line, core: m.to, gen: m.gen,
+        action: index.steps[m.createdAt].note,
+        dupOf: parent ? parent.id : null,
+      }));
+    }
+    // 投递环：整条重传线上的任意副本投递；最早一次为既有生效动作
+    const delivered = [];
+    for (const id of lineage) {
+      for (const s of (index.deliveries.get(id) || [])) {
+        if (!opts || !opts.before || s <= opts.before) delivered.push({ id, s });
+      }
+    }
+    delivered.sort((a, b) => a.s - b.s);
+    delivered.forEach((d, k) => {
+      const m = index.messages.get(d.id);
+      const root = index.messages.get(lineage[0]);
+      out.push(ring({
+        step: d.s,
+        role: k === 0 ? 'deliver' : 'deliver-dup',
+        msgId: d.id, line: m.line, core: m.to, gen: m.gen,
+        action: index.steps[d.s].note,
+        dupOf: m.dupOf,
+        replayOf: k === 0 ? null : delivered[0].s,
+        violation: vioAt(index, d.s),
+      }));
+    });
+    return out;
+  }
+
+  function ackRingsFor(index, line, gen, core, afterStep, opts) {
+    const out = [];
+    for (const a of index.acks) {
+      if (a.line !== line || a.gen !== gen || a.core !== core) continue;
+      if (afterStep != null && a.step < afterStep) continue;
+      if (opts && opts.before != null && a.step > opts.before) continue;
+      const pre = index.steps[a.step - 1].dir[line].pending;
+      const post = index.steps[a.step].dir[line].pending;
+      out.push(ring({
+        step: a.step, role: 'ack', msgId: null,
+        line, core, gen,
+        action: index.steps[a.step].note,
+        closes: !!(pre && pre.gen === gen && post === null),
+        violation: vioAt(index, a.step),
+      }));
+    }
+    return out;
+  }
+
+  // 同世代旁证：同一写升级发出的其他失效消息及其投递、确认
+  function peerRings(index, wu, selfRootId) {
+    const out = [];
+    for (const id of wu.invIds) {
+      if (id === selfRootId) continue;
+      const m = index.messages.get(id);
+      const ln = familyOf(index, id);
+      for (const r of lineageRings(index, ln)) {
+        r.peer = true;
+        out.push(r);
+      }
+      const dstep = ln.map((d) => index.deliveries.get(d) || [])
+        .reduce((a, b) => a.concat(b), [])
+        .filter((s) => !index.steps[s].violation)
+        .sort((a, b) => a - b)[0];
+      for (const r of ackRingsFor(index, wu.line, wu.gen, m.to, dstep != null ? dstep : null)) {
+        r.peer = true;
+        out.push(r);
+      }
+    }
+    return out;
+  }
+
+  function finalizeRings(index, rings, selectedMsgId) {
+    rings.sort((a, b) => {
+      if (a.step !== b.step) return (a.step ?? 1e9) - (b.step ?? 1e9);
+      return (a.msgId || 0) - (b.msgId || 0);
+    });
+    let end = rings.length;
+    for (let i = 0; i < rings.length; i++) {
+      if (rings[i].violation) { end = i + 1; break; } // 链路止于首个违规步
+    }
+    rings = rings.slice(0, end);
+    if (selectedMsgId != null) {
+      let target = rings.find((r) => r.msgId === selectedMsgId && (r.role === 'retransmit' || r.role === 'origin'));
+      if (!target) target = rings.find((r) => r.msgId === selectedMsgId);
+      if (target) target.selected = true;
+    }
+    return rings;
+  }
+
+  function buildMessageChain(index, msgId) {
+    const lineage = familyOf(index, msgId);
+    const rootId = lineage[0];
+    const root = index.messages.get(rootId);
+    if (!root) return { ok: false, error: `消息 M${msgId} 不存在于该记录` };
+    const queried = index.messages.get(msgId);
+
+    const createdEvent = index.steps[root.createdAt].event;
+    const rings = [];
+    let wu = null;
+
+    // 第一环：产生该消息的原始请求
+    if (createdEvent && createdEvent.type === 'write_upgrade') {
+      wu = index.writeUpgrades.find((w) => w.step === root.createdAt) || null;
+      rings.push(ring({
+        step: root.createdAt, role: 'origin', msgId: rootId,
+        line: root.line, core: createdEvent.core, gen: root.gen,
+        action: index.steps[root.createdAt].note,
+        alsoCreated: wu ? wu.invIds.filter((x) => x !== rootId) : [],
+      }));
+    } else {
+      rings.push(ring({
+        step: root.createdAt, role: 'origin', msgId: rootId,
+        line: root.line,
+        core: createdEvent ? createdEvent.core : null,
+        gen: root.gen,
+        action: index.steps[root.createdAt].note,
+      }));
+    }
+
+    for (const r of lineageRings(index, lineage)) rings.push(r);
+
+    // 失效消息：同世代确认（沿真正收到失效的目标核心）；授权消息无确认环
+    if (root.kind === 'inv') {
+      const deliveredSteps = lineage
+        .map((id) => index.deliveries.get(id) || [])
+        .reduce((a, b) => a.concat(b), [])
+        .filter((s) => !index.steps[s].violation)
+        .sort((a, b) => a - b);
+      const first = deliveredSteps[0];
+      if (first != null) {
+        for (const r of ackRingsFor(index, root.line, root.gen, root.to, first)) rings.push(r);
+      }
+      if (wu) {
+        for (const r of peerRings(index, wu, rootId)) rings.push(r);
+      }
+    }
+
+    const closed = root.kind === 'inv' ? index.closureOf(root.line, root.gen) : null;
+    const final = index.steps[index.steps.length - 1];
+    const stillInFlight = final.inFlight.some((m) => lineage.includes(m.id));
+    const terminator = rings.find((r) => r.violation);
+    const ownAck = rings.find((r) => r.role === 'ack' && !r.peer && !r.historical && !r.violation);
+
+    let endNote;
+    if (terminator) {
+      endNote = `链路终止于首个违约步 #${terminator.step}：${terminator.violation.label} — ${terminator.violation.detail}`;
+    } else if (closed) {
+      endNote = `第 ${root.gen} 世代写入已于 #${closed.step} 闭合（最后确认来自 C${closed.closedBy}）`;
+    } else if (root.kind === 'inv' && stillInFlight) {
+      endNote = '消息仍在途：记录中尚无其投递或同世代确认';
+    } else if (root.kind === 'grant' && stillInFlight) {
+      endNote = '授权（或其重传副本）仍在途：记录中尚无其投递';
+    } else if (root.kind === 'inv' && !ownAck) {
+      endNote = `失效已送达 C${root.to}，但记录中缺失其第 ${root.gen} 世代确认（等待关系未完成）`;
+    } else if (root.kind === 'inv') {
+      endNote = `C${root.to} 的第 ${root.gen} 世代确认已接受，但同世代等待集合尚未清空，写入未闭合`;
+    } else {
+      endNote = '授权已投递，授权链路无确认环节';
+    }
+
+    const finalized = finalizeRings(index, rings, msgId);
+    return {
+      ok: true,
+      query: { kind: 'message', msgId },
+      subject: {
+        msgId, rootMsgId: rootId, kind: root.kind,
+        line: root.line, core: root.to, gen: root.gen, dupOf: queried ? queried.dupOf : null,
+      },
+      rings: finalized,
+      relation: null,
+      terminatedByViolation: !!terminator && finalized.some((r) => r.violation),
+      endNote,
+    };
+  }
+
+  function historicalRound(index, line, gen, ackCore) {
+    const wu = index.writeUpgrades.filter((w) => w.line === line && w.gen === gen).pop() || null;
+    if (!wu) return null;
+    const closure = index.closureOf(line, gen);
+    const invId = wu.invIds.find((id) => index.messages.get(id).to === ackCore) || null;
+    return {
+      gen,
+      originStep: wu.step,
+      closedAt: closure ? closure.step : null,
+      closedBy: closure ? closure.closedBy : null,
+      targetedCore: invId != null,
+      invId,
+    };
+  }
+
+  function buildAckChain(index, ackStep) {
+    const steps = index.steps;
+    const ev = steps[ackStep].event;
+    if (!ev || ev.type !== 'ack') return { ok: false, error: `第 ${ackStep} 步不是确认事件` };
+    const line = ev.line;
+    const pre = steps[ackStep - 1];
+    const pending = pre.dir[line].pending;
+    const v = vioAt(index, ackStep);
+    const rings = [];
+    let relation = null;
+
+    // 确认环（接受或拒绝）
+    const ackRing = ring({
+      step: ackStep, role: 'ack', msgId: null,
+      line, core: ev.core, gen: ev.gen,
+      action: steps[ackStep].note,
+      closes: !!(pending && pending.gen === ev.gen && steps[ackStep].dir[line].pending === null),
+      violation: v,
+    });
+
+    if (!v) {
+      // 合法确认：原始写升级 → 该核心的失效（含重传/投递）→ 确认
+      const wu = index.writeUpgrades.filter((w) => w.line === line && w.gen === pending.gen).pop();
+      const invId = wu.invIds.find((id) => index.messages.get(id).to === ev.core);
+      rings.push(ring({
+        step: wu.step, role: 'origin', msgId: invId || null,
+        line, core: wu.core, gen: pending.gen,
+        action: steps[wu.step].note,
+        alsoCreated: wu.invIds.filter((x) => x !== invId),
+      }));
+      const ln = familyOf(index, invId);
+      for (const r of lineageRings(index, ln, { before: ackStep })) rings.push(r);
+      rings.push(ackRing);
+      relation = {
+        status: 'match',
+        pendingGen: pending.gen, waitAcks: pending.waitAcks.slice(),
+        requester: pending.requester, originStep: wu.step,
+        explain: `确认属于第 ${pending.gen} 世代等待集合 {${pending.waitAcks.map((c) => 'C' + c).join(',')}}，等待关系匹配`,
+      };
+    } else {
+      // 迟到/来源不明确认：先摆旧轮证据，再摆当前真实等待关系，最后以拒绝环终止
+      const hist = historicalRound(index, line, ev.gen, ev.core);
+      if (hist) {
+        const hw = index.writeUpgrades.find((w) => w.step === hist.originStep);
+        rings.push(ring({
+          step: hw.step, role: 'origin', historical: true,
+          msgId: hist.invId || (hw.invIds[0] || null),
+          line, core: hw.core, gen: hist.gen,
+          action: steps[hw.step].note,
+          alsoCreated: hw.invIds.filter((x) => x !== (hist.invId || hw.invIds[0])),
+        }));
+        if (hist.closedAt != null) {
+          rings.push(ring({
+            step: hist.closedAt, role: 'ack', historical: true,
+            line, core: hist.closedBy, gen: hist.gen, closes: true,
+            action: steps[hist.closedAt].note,
+          }));
+        }
+      }
+
+      let status; let explain;
+      if (!pending) {
+        status = 'no-pending';
+        explain = hist
+          ? `第 ${ev.gen} 世代写入已于 #${hist.closedAt} 闭合，目录当前无等待中的写入：等待关系已不存在，旧确认必须拒绝`
+          : `L${line} 从未发起第 ${ev.gen} 世代失效，目录也无等待中的写入：确认的等待关系缺失`;
+      } else {
+        const cur = index.writeUpgrades.filter((w) => w.line === line && w.gen === pending.gen).pop();
+        // 当前真实等待轮的原始请求与各失效投递
+        rings.push(ring({
+          step: cur.step, role: 'origin', msgId: cur.invIds[0] || null,
+          line, core: cur.core, gen: cur.gen,
+          action: steps[cur.step].note,
+          alsoCreated: cur.invIds.slice(1),
+        }));
+        const invs = cur.invIds.map((id) => {
+          const m = index.messages.get(id);
+          const ln = familyOf(index, id);
+          const dstep = ln.map((d) => (index.deliveries.get(d) || [])[0])
+            .filter((s) => s != null).sort((a, b) => a - b)[0] || null;
+          return { msgId: id, to: m.to, gen: m.gen, deliveredStep: dstep };
+        });
+        for (const info of invs) {
+          const ln = familyOf(index, info.msgId);
+          for (const r of lineageRings(index, ln, { before: ackStep })) rings.push(r);
+        }
+        if (pending.gen !== ev.gen) {
+          status = 'gen-mismatch';
+          explain = `确认携带世代 ${ev.gen}，目录当前等待第 ${pending.gen} 世代（请求者 C${pending.requester}，等待集合 {${pending.waitAcks.map((c) => 'C' + c).join(',')}}）：世代失配，旧确认不得闭合新一轮写入`;
+        } else if (!pending.waitAcks.includes(ev.core)) {
+          status = 'not-waiting';
+          explain = `C${ev.core} 不在第 ${pending.gen} 世代等待集合 {${pending.waitAcks.map((c) => 'C' + c).join(',')}} 中：该确认与本轮等待关系无关`;
+        } else {
+          status = 'no-owed-ack';
+          explain = `C${ev.core} 未登记第 ${ev.gen} 世代的待确认失效（失效未投递）：确认缺少来源等待关系`;
+        }
+        relation = {
+          status,
+          pendingGen: pending.gen, waitAcks: pending.waitAcks.slice(),
+          requester: pending.requester, originStep: cur.step, invs,
+          historical: hist ? {
+            gen: hist.gen, originStep: hist.originStep,
+            closedAt: hist.closedAt, closedBy: hist.closedBy, targetedCore: hist.targetedCore,
+          } : null,
+          explain,
+        };
+      }
+      if (!relation) {
+        relation = {
+          status,
+          pendingGen: null, waitAcks: [], requester: null, originStep: null, invs: [],
+          historical: hist ? {
+            gen: hist.gen, originStep: hist.originStep,
+            closedAt: hist.closedAt, closedBy: hist.closedBy, targetedCore: hist.targetedCore,
+          } : null,
+          explain,
+        };
+      }
+      rings.push(ackRing);
+    }
+
+    const finalized = finalizeRings(index, rings, null);
+    const sel = finalized.find((r) => r.step === ackStep && r.role === 'ack');
+    if (sel) sel.selected = true;
+    return {
+      ok: true,
+      query: { kind: 'ack', step: ackStep },
+      subject: { kind: 'ack', msgId: null, line, core: ev.core, gen: ev.gen },
+      rings: finalized,
+      relation,
+      terminatedByViolation: !!v,
+      endNote: v
+        ? `链路终止于首个违约步 #${ackStep}：${v.label} — ${v.detail}`
+        : (ackRing.closes
+          ? `第 ${ev.gen} 世代写入已于 #${ackStep} 闭合（最后确认来自 C${ev.core}）`
+          : `确认接受，第 ${ev.gen} 世代仍等待其余核心`),
+    };
+  }
+
+  function buildChain(result, query) {
+    if (!result || !result.ok || !Array.isArray(result.steps)) {
+      return { ok: false, error: '因果链需要一次完整的回放结果' };
+    }
+    if (!query || typeof query !== 'object') return { ok: false, error: '缺少链路查询' };
+    const index = buildTraceIndex(result);
+    if (query.kind === 'message') {
+      if (!Number.isInteger(query.msgId) || query.msgId < 1) return { ok: false, error: '消息号非法' };
+      return buildMessageChain(index, query.msgId);
+    }
+    if (query.kind === 'ack') {
+      if (!Number.isInteger(query.step) || query.step < 1 || query.step > result.steps.length - 1) {
+        return { ok: false, error: '确认事件步非法' };
+      }
+      return buildAckChain(index, query.step);
+    }
+    return { ok: false, error: `未知链路查询类型 ${query.kind}` };
+  }
+
+  // 页面选择入口：列出记录中全部可回溯对象（消息 + 确认）
+  function listTraceables(result) {
+    if (!result || !result.ok) return { messages: [], acks: [] };
+    const index = buildTraceIndex(result);
+    const finalStep = result.steps[result.steps.length - 1];
+    const messages = [...index.messages.values()]
+      .sort((a, b) => a.id - b.id)
+      .map((m) => {
+        const dSteps = index.deliveries.get(m.id) || [];
+        const deliveredStep = dSteps[0] != null ? dSteps[0] : null;
+        const frozenStep = dSteps.find((s) => result.steps[s].violation) || null;
+        return {
+          kind: 'message', msgId: m.id, msgKind: m.kind,
+          to: m.to, line: m.line, gen: m.gen, dupOf: m.dupOf,
+          createdAt: m.createdAt, deliveredStep, frozenStep,
+          inFlightAtEnd: finalStep.inFlight.some((x) => x.id === m.id),
+        };
+      });
+    const acks = index.acks.map((a) => ({
+      kind: 'ack', step: a.step, core: a.core, line: a.line, gen: a.gen,
+      rejected: !!result.steps[a.step].violation,
+    }));
+    return { messages, acks };
+  }
+
   // ---------- 快照与主循环 ----------
 
   function snapshot(state, index, event, note, vio) {
@@ -452,7 +944,8 @@
   }
 
   return {
-    LIMITS, VIOLATION, VIOLATION_LABELS,
+    LIMITS, VIOLATION, VIOLATION_LABELS, CHAIN_ROLE_LABELS,
     createState, simulate, checkConsistency, effectiveHolders,
+    buildChain, listTraceables,
   };
 });

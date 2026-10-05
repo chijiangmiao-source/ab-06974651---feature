@@ -50,6 +50,22 @@
     <table id="cacheTable" class="grid"></table>
     <h2>在途消息</h2>
     <div id="inflight"></div>
+    <h2>因果链回溯</h2>
+    <div class="btnrow trace-row">
+      <label>从消息回看：
+        <select id="traceMsg"></select>
+      </label>
+      <label>从确认回看：
+        <select id="traceAck"></select>
+      </label>
+      <span id="chainStatus" class="dim"></span>
+    </div>
+    <p class="hint">点击上方在途消息标签或选择一条消息/确认，展示从<b>原始请求</b>到所选消息、
+      再到相关投递与同世代确认的有序因果链；每环标明事件序号、消息号、缓存线、核心、世代与动作结果。
+      超时重传经 <code>dupOf</code> 关联原始消息；重复投递只回放既有动作；迟到确认链路止于首个违规步。</p>
+    <div id="chainView">
+      <p class="dim">点击在途消息标签，或从上方选择一条消息 / 确认，查看从原始请求出发的有序因果链。</p>
+    </div>
   </section>
 </main>
 <script src="protocol.js"></script>
