@@ -1,0 +1,13 @@
+{
+  "name": "dirreplay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "星载载荷目录缓存重放复核器：世代绑定的失效/确认审计",
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node --test tests/",
+    "build": "node scripts/build.js",
+    "smoke": "node scripts/smoke.js",
+    "verify": "node scripts/verify.js"
+  }
+}

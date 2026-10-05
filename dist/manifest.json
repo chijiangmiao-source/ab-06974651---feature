@@ -1,0 +1,30 @@
+{
+  "builtAt": "2026-10-05T01:43:29.642Z",
+  "files": [
+    {
+      "name": "index.html",
+      "bytes": 2551,
+      "sha256": "fb953b45996f4c609ab9fff1bc50e4ab378d291810cb2b3812a1a574f307e108"
+    },
+    {
+      "name": "main.js",
+      "bytes": 11256,
+      "sha256": "33d3877c21c11976e8270410b92f884e7a71654b71791956fe1795c2dc76710d"
+    },
+    {
+      "name": "protocol.js",
+      "bytes": 19620,
+      "sha256": "b4801978ac095802210b8ee14cfb20edb390569df7022a8870e838ac86a31069"
+    },
+    {
+      "name": "styles.css",
+      "bytes": 3940,
+      "sha256": "8af44a2411595f1566e915feb0fca8b3a617cf9ab917bda03546e13c2f170b3d"
+    },
+    {
+      "name": "worker.js",
+      "bytes": 572,
+      "sha256": "f06c134d1e91f15bedc56b4481a45ccbbb403b31f79ea7f23f6698d63bbbc28f"
+    }
+  ]
+}

@@ -1,0 +1,172 @@
+:root {
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --panel2: #1d2638;
+  --border: #2b3550;
+  --text: #dbe4f5;
+  --dim: #8b98b8;
+  --accent: #5aa2ff;
+  --bad: #ff5f6b;
+  --ok: #43d19e;
+  --warn: #ffb84d;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+header {
+  padding: 18px 24px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+header h1 { margin: 0 0 6px; font-size: 20px; }
+header .sub { margin: 0; color: var(--dim); }
+
+#app {
+  display: grid;
+  grid-template-columns: minmax(340px, 5fr) minmax(420px, 7fr);
+  gap: 16px;
+  padding: 16px 24px 32px;
+  align-items: start;
+}
+
+@media (max-width: 900px) { #app { grid-template-columns: 1fr; } }
+
+section {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+h2 {
+  font-size: 14px;
+  margin: 14px 0 8px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+h2:first-child { margin-top: 0; }
+
+textarea {
+  width: 100%;
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: 12px/1.5 ui-monospace, "SF Mono", Consolas, monospace;
+  padding: 10px;
+  resize: vertical;
+}
+
+.btnrow { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+
+button {
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #0b1220; font-weight: 600; }
+button.danger { border-color: var(--bad); color: var(--bad); }
+
+.hint { color: var(--dim); font-size: 12px; }
+code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+
+.events { margin: 0; padding-left: 22px; max-height: 320px; overflow: auto; }
+.events li {
+  padding: 3px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12.5px;
+}
+.events li:hover { background: var(--panel2); }
+.events li.active { background: var(--accent); color: #0b1220; font-weight: 600; }
+.events li.bad { color: var(--bad); }
+.events li.bad.active { background: var(--bad); color: #fff; }
+
+#statusBar {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+#stepInfo { color: var(--dim); white-space: nowrap; }
+
+#violation {
+  background: rgba(255, 95, 107, 0.12);
+  border: 1px solid var(--bad);
+  color: #ffd7da;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+#violation.hidden { display: none; }
+
+.note {
+  min-height: 1.4em;
+  color: var(--warn);
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+table.grid {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+table.grid th, table.grid td {
+  border: 1px solid var(--border);
+  padding: 5px 8px;
+  text-align: left;
+}
+
+table.grid thead th { background: var(--panel2); color: var(--dim); }
+
+td.gen { font-weight: 700; color: var(--accent); }
+
+td.st-I, tr.st-I td:nth-child(2) { color: var(--dim); }
+td.st-S, tr.st-S td:nth-child(2) { color: var(--accent); }
+td.st-E, tr.st-E td:nth-child(2) { color: var(--ok); }
+td.st-M { color: var(--warn); }
+td small { color: var(--dim); }
+
+#inflight { min-height: 28px; }
+.dim { color: var(--dim); }
+
+.chip {
+  display: inline-block;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  margin: 2px 4px 2px 0;
+  font: 12px ui-monospace, Consolas, monospace;
+}
+
+.chip.inv { border-color: var(--warn); }
+.chip.grant { border-color: var(--ok); }
+.chip em { color: var(--warn); font-style: normal; }

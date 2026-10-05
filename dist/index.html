@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>目录缓存重放复核器</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <h1>星载载荷 · 目录缓存重放复核器</h1>
+  <p class="sub">总线短暂丢包后的失效/确认审计：每条失效请求绑定递增世代，
+    仅当前等待集合中的同世代确认可推进写入；首次违约步即冻结并给出线、核心与消息。</p>
+</header>
+<main id="app">
+  <section id="left">
+    <h2>事件导入</h2>
+    <textarea id="jsonInput" spellcheck="false" rows="18"
+      placeholder='{"cores":3,"lines":1,"events":[{"type":"read_miss","core":0,"line":0}]}'></textarea>
+    <div class="btnrow">
+      <button id="btnImport" class="primary">导入并回放</button>
+      <button data-sample="legal">示例·合法重传闭合</button>
+      <button data-sample="lateAck">示例·迟到确认拒绝</button>
+      <button data-sample="missingData">示例·缺失拥有者数据</button>
+      <button id="btnClearDraft">清除本地草稿</button>
+    </div>
+    <p class="hint">限制：≤4 核、≤8 缓存线、≤48 事件。事件类型：
+      <code>read_miss</code> / <code>write_upgrade</code>（可带 <code>data</code>）/
+      <code>deliver</code>（<code>msg</code>）/ <code>timeout</code>（<code>msg</code>）/
+      <code>ack</code>（<code>core</code>,<code>line</code>,<code>gen</code>）。
+      消息编号 M1、M2… 按生成顺序确定，可在右侧“在途消息”中查看。</p>
+    <h2>事件序列</h2>
+    <ol id="eventList" class="events"></ol>
+  </section>
+  <section id="right">
+    <div class="btnrow controls">
+      <button id="btnPrev">◀ 上一步</button>
+      <button id="btnNext">下一步 ▶</button>
+      <button id="btnPlay">整段回放</button>
+      <button id="btnPause">暂停</button>
+      <button id="btnReset">重置</button>
+      <button id="btnCancel" class="danger">取消运行</button>
+    </div>
+    <div id="statusBar"><span id="status">就绪</span><span id="stepInfo"></span></div>
+    <div id="violation" class="hidden"></div>
+    <div id="note" class="note"></div>
+    <h2>目录</h2>
+    <table id="dirTable" class="grid"></table>
+    <h2>各核缓存副本</h2>
+    <table id="cacheTable" class="grid"></table>
+    <h2>在途消息</h2>
+    <div id="inflight"></div>
+  </section>
+</main>
+<script src="protocol.js"></script>
+<script src="main.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+FROM node:20-alpine
+WORKDIR /app
+COPY app/ app/
+COPY tests/ tests/
+COPY scripts/ scripts/
+CMD ["node", "scripts/verify.js"]
