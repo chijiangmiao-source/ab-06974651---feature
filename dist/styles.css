@@ -56,6 +56,22 @@ h2 {
 
 h2:first-child { margin-top: 0; }
 
+h2 select {
+  font-size: 12px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  vertical-align: middle;
+  max-width: 60%;
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 6px;
+}
+
+h2 button { vertical-align: middle; padding: 3px 10px; font-size: 12px; }
+
 textarea {
   width: 100%;
   background: var(--panel2);
@@ -170,3 +186,75 @@ td small { color: var(--dim); }
 .chip.inv { border-color: var(--warn); }
 .chip.grant { border-color: var(--ok); }
 .chip em { color: var(--warn); font-style: normal; }
+
+button.chip { cursor: pointer; font-family: inherit; }
+button.chip:hover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+
+button.mini {
+  padding: 0 6px;
+  margin-left: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  border-radius: 5px;
+  vertical-align: middle;
+}
+
+.traceBtn { margin-left: 8px; }
+
+/* ---------- 因果链面板 ---------- */
+
+#tracePanel { margin-top: 8px; }
+#tracePanel.hidden { display: none; }
+
+.traceHead { font-weight: 700; margin-bottom: 6px; }
+.traceHead span { margin-left: 8px; font-size: 12px; }
+.t-ok { color: var(--ok); }
+.t-bad { color: var(--bad); }
+.t-pending { color: var(--warn); }
+
+.traceNotice {
+  background: rgba(90, 162, 255, 0.1);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 5px 9px;
+  margin: 4px 0;
+  font-size: 12.5px;
+}
+
+.traceReject {
+  background: rgba(255, 95, 107, 0.12);
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  padding: 7px 10px;
+  margin: 6px 0;
+  font-size: 12.5px;
+}
+
+.traceOk {
+  background: rgba(67, 209, 158, 0.12);
+  border: 1px solid var(--ok);
+  border-radius: 6px;
+  padding: 7px 10px;
+  margin: 6px 0;
+  font-size: 12.5px;
+}
+
+.traceWait {
+  background: rgba(255, 184, 77, 0.1);
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  padding: 7px 10px;
+  margin: 6px 0;
+  font-size: 12.5px;
+}
+
+table.traceTable { margin-top: 8px; font-size: 12px; }
+table.traceTable td { cursor: pointer; vertical-align: top; }
+table.traceTable td.num { white-space: nowrap; font-family: ui-monospace, Consolas, monospace; }
+table.traceTable tr:hover td { background: rgba(90, 162, 255, 0.08); }
+table.traceTable tr.trace-current td { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+tr.trace-origin td { color: var(--dim); }
+tr.trow-replay td:nth-child(7), tr.trow-replay td:nth-child(8) { color: var(--accent); }
+tr.trow-pending td:nth-child(7), tr.trow-pending td:nth-child(8) { color: var(--warn); }
+tr.trace-viol td { color: #ffd7da; background: rgba(255, 95, 107, 0.1); }

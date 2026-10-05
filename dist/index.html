@@ -50,6 +50,14 @@
     <table id="cacheTable" class="grid"></table>
     <h2>在途消息</h2>
     <div id="inflight"></div>
+    <h2>因果链追溯
+      <select id="traceSelect" title="选择消息（含已投递/被拒/重传副本）"></select>
+      <button id="btnTrace" class="primary">追溯所选消息</button>
+    </h2>
+    <p class="hint">点击上方在途消息标签、事件序列中的「链」按钮，或在此下拉选择任意曾出现的消息，
+      即可查看 <b>原始请求 → 消息 → 超时重传 → 投递 → 同世代确认 → 闭合/拒绝</b> 的有序因果链。
+      重传副本显式关联原始消息；链路在首个违规步终止并说明拒绝原因。</p>
+    <div id="tracePanel" class="hidden"></div>
   </section>
 </main>
 <script src="protocol.js"></script>

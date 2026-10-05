@@ -451,8 +451,523 @@
     };
   }
 
+  // ---------- 因果链追溯 ----------
+  //
+  // 审查员选中一条在途（或曾出现的）消息时，从逐步快照反推出有序因果链：
+  //   原始请求（写升级/读缺失）→ 原始消息 → 超时重传副本 → 投递 → 同世代确认 → 闭合；
+  // 重传副本通过 dupOf 关联其原始消息，重复投递环只指向既有投递动作，
+  // 迟到/失配确认与过期消息在首个违约环终止并给出拒绝原因。
+  // 追溯是对 simulate 结果的纯函数派生，本身不产生或修改任何证据。
+
+  function mkLink(o) {
+    return {
+      role: o.role,            // origin / timeout / send / deliver / ack / close / pending / refuse
+      step: o.step,            // 事件序号（1 起；pending 环取末步）
+      order: o.order !== undefined ? o.order : 9,  // 同一步内的因果先后
+      msgId: o.msgId !== undefined ? o.msgId : null,
+      msgIds: o.msgIds || null,        // 一环涉及多条消息（如写升级同时发出若干失效）
+      msgRefId: o.msgRefId !== undefined ? o.msgRefId : null, // 非消息环节引用的既有消息（如确认↔失效）
+      line: o.line !== undefined ? o.line : null,
+      core: o.core !== undefined ? o.core : null,
+      gen: o.gen !== undefined ? o.gen : null,
+      action: o.action,
+      result: o.result || '',
+      status: o.status || 'info',      // info / ok / replay / bad / pending
+      violation: o.violation || null,
+    };
+  }
+
+  // 从快照序列重建消息登记簿：每条曾出现消息的出生步、dupOf 溯源与投递/超时效应。
+  function buildRegistry(result) {
+    const byId = new Map();
+    const effects = new Map(); // msgId -> [{type:'deliver'|'timeout', step, newId, violation}]
+    const acks = [];
+    const linkedViolations = []; // 非投递/超时事件中、引用了某条消息的违约（如缺失拥有者数据）
+    let prevIds = new Set();
+
+    const addEffect = (id, e) => {
+      if (!effects.has(id)) effects.set(id, []);
+      effects.get(id).push(e);
+    };
+
+    for (let i = 1; i < result.steps.length; i++) {
+      const s = result.steps[i];
+      const ev = s.event;
+      for (const m of s.inFlight) {
+        if (!byId.has(m.id)) {
+          let rootId = m.id;
+          if (m.dupOf !== null && byId.has(m.dupOf)) rootId = byId.get(m.dupOf).rootId;
+          byId.set(m.id, {
+            id: m.id, kind: m.kind, to: m.to, line: m.line, gen: m.gen,
+            dupOf: m.dupOf, rootId, bornStep: i,
+            grantState: m.grantState !== undefined ? m.grantState : null,
+          });
+        }
+      }
+      if (ev) {
+        if (ev.type === 'deliver') {
+          addEffect(ev.msg, { type: 'deliver', step: i, violation: s.violation ? clone(s.violation) : null });
+        } else if (ev.type === 'timeout') {
+          let newId = null;
+          for (const m of s.inFlight) {
+            if (!prevIds.has(m.id)) { newId = m.id; break; }
+          }
+          addEffect(ev.msg, { type: 'timeout', step: i, newId, violation: s.violation ? clone(s.violation) : null });
+        } else if (ev.type === 'ack') {
+          acks.push({ step: i, core: ev.core, line: ev.line, gen: ev.gen, violation: s.violation ? clone(s.violation) : null });
+        }
+      }
+      if (s.violation && s.violation.msgId !== null && s.violation.msgId !== undefined
+        && (!ev || (ev.type !== 'deliver' && ev.type !== 'timeout'))) {
+        linkedViolations.push({ step: i, msgId: s.violation.msgId, violation: clone(s.violation) });
+      }
+      prevIds = new Set(s.inFlight.map((m) => m.id));
+    }
+    return { byId, effects, acks, linkedViolations };
+  }
+
+  function deliveriesOf(reg, id) {
+    return (reg.effects.get(id) || [])
+      .filter((e) => e.type === 'deliver')
+      .sort((a, b) => a.step - b.step);
+  }
+
+  function copiesOf(reg, member) {
+    return [...reg.byId.values()]
+      .filter((r) => r.rootId === member.id)
+      .sort((a, b) => (a.bornStep - b.bornStep) || (a.id - b.id));
+  }
+
+  // 一条消息（含其全部重传副本）的出生/超时/投递环。
+  function messageTimelineLinks(result, reg, member) {
+    const links = [];
+    const copies = copiesOf(reg, member);
+    for (const c of copies) {
+      if (c.dupOf !== null) {
+        links.push(mkLink({
+          role: 'timeout', step: c.bornStep, order: 1, msgId: c.dupOf,
+          line: member.line, core: member.to, gen: member.gen,
+          action: `超时：重传在途消息 M${c.dupOf} → M${c.id}`,
+          result: result.steps[c.bornStep].note, status: 'ok',
+        }));
+      }
+      links.push(mkLink({
+        role: 'send', step: c.bornStep, order: 2, msgId: c.id,
+        line: member.line, core: member.to, gen: member.gen,
+        action: c.dupOf !== null
+          ? `生成重传副本 M${c.id}（dupOf=M${c.dupOf}，原始来源 M${member.id}）`
+          : (member.kind === 'inv'
+              ? `生成失效请求 M${c.id} → C${member.to}（L${member.line}，世代 ${member.gen}）`
+              : `生成授权 M${c.id}（${c.grantState}）→ C${member.to}（L${member.line}，世代 ${member.gen}）`),
+        result: c.dupOf !== null
+          ? '仅复制在途消息：缓存线、目标核心、世代与原件一致，不产生新动作或新来源'
+          : result.steps[c.bornStep].note,
+        status: 'info',
+      }));
+    }
+
+    // 所有副本的首次投递按到达先后排序：首个到达者执行真实动作，
+    // 之后到达的（无论原件还是副本）都只能回放既有动作。
+    const arrivals = [];
+    for (const c of copies) {
+      const d = deliveriesOf(reg, c.id)[0];
+      if (d) arrivals.push({ copy: c, step: d.step, violation: d.violation });
+    }
+    arrivals.sort((a, b) => (a.step - b.step) || (a.copy.id - b.copy.id));
+    const firstDelivery = arrivals.length
+      ? { step: arrivals[0].step, msgId: arrivals[0].copy.id } : null;
+
+    for (const a of arrivals) {
+      const c = a.copy;
+      const replay = a.step !== firstDelivery.step;
+      const viaDup = c.dupOf !== null;
+      let action;
+      if (member.kind === 'inv') {
+        action = replay
+          ? `重复投递 M${c.id}：仅回放第 ${firstDelivery.step} 步 M${firstDelivery.msgId} 的既有动作`
+            + `（重新登记 C${member.to} 的世代 ${member.gen} 待确认），不另造来源`
+          : `投递失效 M${c.id} 至 C${member.to}`
+            + (viaDup ? `（重传副本 M${c.id} 先于原件到达，执行原件 M${member.id} 的动作）` : '');
+      } else {
+        action = replay
+          ? `重复投递授权 M${c.id}：仅回放第 ${firstDelivery.step} 步 M${firstDelivery.msgId} 的既有动作（保持既有副本），不另造来源`
+          : `投递授权 M${c.id} 至 C${member.to}`
+            + (viaDup ? `（重传副本 M${c.id} 先于原件 M${member.id} 到达）` : '');
+      }
+      links.push(mkLink({
+        role: 'deliver', step: a.step, order: 3, msgId: c.id,
+        line: member.line, core: member.to, gen: member.gen,
+        action, result: result.steps[a.step].note,
+        status: a.violation ? 'bad' : (replay ? 'replay' : 'ok'),
+        violation: a.violation,
+      }));
+    }
+
+    // 非法超时（引用已不在在途集合的消息，无副本出生）：显式拒绝环，不伪造成重传。
+    const copyIds = new Set(copies.map((c) => c.id));
+    for (const c of copies) {
+      for (const e of (reg.effects.get(c.id) || [])) {
+        if (e.type !== 'timeout') continue;
+        const born = e.newId !== null && copyIds.has(e.newId);
+        if (born) continue;
+        links.push(mkLink({
+          role: 'refuse', step: e.step, order: 1, msgId: c.id,
+          line: member.line, core: member.to, gen: member.gen,
+          action: `超时重传 M${c.id} 被拒绝：该消息不在在途集合（已投递或从未在途）`,
+          result: result.steps[e.step].note, status: 'bad', violation: e.violation,
+        }));
+      }
+    }
+    return { links, copies, firstDelivery };
+  }
+
+  // 失效消息对应核心的确认环（含闭合判定与缺失/失配等待关系）。
+  function invAckLinks(result, reg, member, firstDelivery) {
+    const links = [];
+    const candidates = reg.acks
+      .filter((a) => a.core === member.to && a.line === member.line && a.step > member.bornStep)
+      .sort((a, b) => a.step - b.step);
+
+    let accepted = false;
+    let closed = false;
+    let closeStep = null;
+    for (const a of candidates) {
+      if (accepted) {
+        // 闭合之后的同类确认只可能是违规的重复确认
+        if (a.violation) {
+          links.push(mkLink({
+            role: 'ack', step: a.step, order: 4, msgRefId: member.id,
+            line: member.line, core: member.to, gen: a.gen,
+            action: `迟到/重复确认：C${member.to} 世代 ${a.gen}（第 ${member.bornStep} 步的 M${member.id} 一轮已处理过）`,
+            result: `${result.steps[a.step].note}｜该确认不对应任何现存等待关系，链路在此终止`,
+            status: 'bad', violation: a.violation,
+          }));
+          return { links, pending: false, closed, closeStep, accepted, rejected: true };
+        }
+        continue;
+      }
+      if (a.violation) {
+        const matched = a.gen === member.gen;
+        const deliverTxt = firstDelivery
+          ? `失效 M${member.id} 已于第 ${firstDelivery.step} 步送达`
+          : `失效 M${member.id} 尚未送达（仍在途）`;
+        links.push(mkLink({
+          role: 'ack', step: a.step, order: 4, msgRefId: member.id,
+          line: member.line, core: member.to, gen: a.gen,
+          action: matched
+            ? `C${member.to} 的世代 ${a.gen} 确认被拒绝（对应失效 M${member.id}）`
+            : `迟到确认：C${member.to} 持世代 ${a.gen}，等待关系要求世代 ${member.gen}`,
+          result: `${result.steps[a.step].note}｜${deliverTxt}；等待关系缺失或失配，不得据此闭合写入`,
+          status: 'bad', violation: a.violation,
+        }));
+        return { links, pending: false, closed: false, closeStep: null, accepted: false, rejected: true };
+      }
+      if (a.gen !== member.gen) continue; // 属于其他世代的合法确认，与本消息无关
+      const before = result.steps[a.step - 1].dir[member.line].pending;
+      const after = result.steps[a.step].dir[member.line].pending;
+      links.push(mkLink({
+        role: 'ack', step: a.step, order: 4, msgRefId: member.id,
+        line: member.line, core: member.to, gen: a.gen,
+        action: `C${member.to} 的世代 ${a.gen} 确认接受（对应失效 M${member.id}）`,
+        result: result.steps[a.step].note, status: 'ok',
+      }));
+      accepted = true;
+      if (!after && before && before.gen === member.gen) {
+        closed = true; closeStep = a.step;
+        links.push(mkLink({
+          role: 'close', step: a.step, order: 5, msgRefId: member.id,
+          line: member.line, core: before.requester, gen: member.gen,
+          action: `等待集合清空，第 ${member.gen} 世代写入闭合`,
+          result: `C${before.requester} 获得独占（M，L${member.line}，世代 ${member.gen}）`,
+          status: 'ok',
+        }));
+      }
+    }
+    return { links, pending: !accepted, closed, closeStep, accepted, rejected: false };
+  }
+
+  function pendingInvLink(result, member, copies, delivered) {
+    const lastStep = result.steps.length - 1;
+    const fin = result.steps[lastStep];
+    const fp = fin.dir[member.line].pending;
+    const waiting = fp && fp.gen === member.gen && fp.waitAcks.includes(member.to);
+    const lastCopy = copies[copies.length - 1];
+    const text = !delivered
+      ? `失效尚未送达 C${member.to}：最新副本 M${lastCopy.id} 仍在途`
+      : `失效已送达 C${member.to}，但其世代 ${member.gen} 确认未出现`;
+    return mkLink({
+      role: 'pending', step: lastStep, order: 9, msgId: lastCopy.id,
+      line: member.line, core: member.to, gen: member.gen,
+      action: waiting
+        ? `等待关系未结清：C${member.to} 的世代 ${member.gen} 确认缺失`
+        : `未见 C${member.to} 的世代 ${member.gen} 确认（回放于第 ${lastStep} 步停止）`,
+      result: `${text}；等待集合 ${fp && fp.gen === member.gen ? `{${cores(fp.waitAcks)}}` : '（已无该世代等待）'}`,
+      status: 'pending',
+    });
+  }
+
+  // 将 {msg} 或 {step}（投递/超时/确认事件）解析到一条既有消息；找不到时显式标注，不伪造来源。
+  function resolveTarget(result, reg, ref) {
+    if (!ref) return {};
+    if (ref.msg !== null && ref.msg !== undefined) {
+      return { rec: reg.byId.get(ref.msg) || null };
+    }
+    if (ref.step !== null && ref.step !== undefined) {
+      const s = result.steps[ref.step];
+      if (!s || !s.event) return {};
+      const ev = s.event;
+      if (ev.type === 'deliver' || ev.type === 'timeout') {
+        return {
+          rec: reg.byId.get(ev.msg) || null,
+          missingMsg: reg.byId.has(ev.msg) ? null : ev.msg,
+          refStep: ref.step,
+        };
+      }
+      if (ev.type === 'ack') {
+        const exact = [...reg.byId.values()]
+          .filter((r) => r.kind === 'inv' && r.to === ev.core && r.line === ev.line
+            && r.gen === ev.gen && r.bornStep < ref.step)
+          .sort((a, b) => b.bornStep - a.bornStep)[0] || null;
+        if (exact) return { rec: exact, refStep: ref.step };
+        const pend = s.dir[ev.line].pending;
+        if (pend) {
+          const current = [...reg.byId.values()]
+            .find((r) => r.kind === 'inv' && r.to === ev.core && r.line === ev.line && r.gen === pend.gen) || null;
+          if (current) return { rec: current, refStep: ref.step };
+        }
+        return {
+          rec: null, refStep: ref.step,
+          originlessAck: { step: ref.step, core: ev.core, line: ev.line, gen: ev.gen, violation: s.violation },
+        };
+      }
+    }
+    return {};
+  }
+
+  function originlessChain(result, target) {
+    if (target.originlessAck) {
+      const a = target.originlessAck;
+      const sNote = result.steps[a.step].note;
+      const links = [mkLink({
+        role: 'ack', step: a.step, order: 4,
+        line: a.line, core: a.core, gen: a.gen,
+        action: `C${a.core} 对 L${a.line} 的世代 ${a.gen} 确认到达`,
+        result: `${sNote}｜无匹配的既有失效请求或等待关系（不伪造来源），链路在首个违规步终止`,
+        status: 'bad', violation: a.violation,
+      })];
+      // 缺失/失配的等待关系：用违约步的目录实况说明
+      let waiting = null;
+      const pd = result.steps[a.step].dir[a.line];
+      if (!pd.pending) {
+        waiting = `L${a.line} 目录无等待中的写入：C${a.core} 的世代 ${a.gen} 确认没有可匹配的等待关系`;
+      } else if (pd.pending.gen !== a.gen) {
+        waiting = `等待关系要求世代 ${pd.pending.gen}（等待集合 {${cores(pd.pending.waitAcks)}}），到达的却是世代 ${a.gen}：世代失配`;
+      } else if (!pd.pending.waitAcks.includes(a.core)) {
+        waiting = `世代 ${pd.pending.gen} 匹配，但 C${a.core} 不在等待集合 {${cores(pd.pending.waitAcks)}} 中`;
+      } else {
+        waiting = `C${a.core} 未登记世代 ${a.gen} 的待确认失效：等待关系存在但确认来源缺失/失配`;
+      }
+      return {
+        ok: true, status: 'rejected', selected: null, rootId: null,
+        links, terminal: links[0], terminalStep: a.step,
+        rejection: a.violation ? { kind: a.violation.kind, detail: a.violation.detail } : null,
+        notices: ['该确认找不到任何既有失效来源：等待关系缺失或失配'],
+        waiting, closure: null,
+      };
+    }
+    const msgId = target.missingMsg;
+    const step = target.refStep;
+    const links = [mkLink({
+      role: 'refuse', step, order: 6, msgId,
+      action: `引用消息 M${msgId}，但该消息从未生成或已离开在途集合`,
+      result: `${result.steps[step].note}｜无可追溯的既有消息来源（不伪造来源）`,
+      status: 'bad', violation: result.steps[step].violation,
+    })];
+    return {
+      ok: true, status: 'rejected', selected: { id: msgId, missing: true }, rootId: null,
+      links, terminal: links[0], terminalStep: step,
+      rejection: result.steps[step].violation
+        ? { kind: result.steps[step].violation.kind, detail: result.steps[step].violation.detail }
+        : null,
+      notices: [], waiting: null, closure: null,
+    };
+  }
+
+  function traceCausalChain(result, ref) {
+    if (!result || result.ok !== true) {
+      return { ok: false, error: '缺少可追溯的回放结果', status: 'invalid', links: [] };
+    }
+    const reg = buildRegistry(result);
+    const target = resolveTarget(result, reg, ref);
+    if (!target.rec) return Object.assign({ ok: true }, originlessChain(result, target));
+
+    const selected = target.rec;
+    const root = reg.byId.get(selected.rootId);
+    const idSet = new Set();
+    const links = [];
+    const notices = [];
+    let closure = null;
+
+    if (selected.dupOf !== null) {
+      notices.push(`所选 M${selected.id} 是超时重传副本：dupOf=M${selected.dupOf}，原始来源 M${root.id}；重传不产生新动作或新来源`);
+    }
+
+    if (root.kind === 'inv') {
+      // 同一次写升级、同一缓存线/世代发出的全部失效为兄弟消息，同世代失效与确认一并可追溯。
+      const members = [...reg.byId.values()]
+        .filter((r) => r.kind === 'inv' && r.line === root.line && r.gen === root.gen && r.bornStep === root.bornStep)
+        .sort((a, b) => a.id - b.id);
+      const originEv = result.steps[root.bornStep].event;
+      links.push(mkLink({
+        role: 'origin', step: root.bornStep, order: 0, msgIds: members.map((m) => m.id),
+        line: root.line, core: originEv.core, gen: root.gen,
+        action: `写升级 C${originEv.core} 发起第 ${root.gen} 世代失效（L${root.line}）`,
+        result: result.steps[root.bornStep].note, status: 'info',
+      }));
+      const pendingLinks = [];
+      for (const m of members) {
+        idSet.add(m.id);
+        const tl = messageTimelineLinks(result, reg, m);
+        for (const c of tl.copies) idSet.add(c.id);
+        links.push(...tl.links);
+        const al = invAckLinks(result, reg, m, tl.firstDelivery);
+        links.push(...al.links);
+        if (al.closed && !closure) {
+          closure = { step: al.closeStep, gen: m.gen, requester: result.steps[al.closeStep - 1].dir[m.line].pending.requester };
+        }
+        if (al.pending) {
+          pendingLinks.push(pendingInvLink(result, m, tl.copies, !!tl.firstDelivery));
+        }
+      }
+      links.push(...pendingLinks);
+    } else {
+      const originEv = result.steps[root.bornStep].event;
+      links.push(mkLink({
+        role: 'origin', step: root.bornStep, order: 0, msgIds: [root.id],
+        line: root.line, core: originEv.core, gen: root.gen,
+        action: `读缺失 C${originEv.core}（L${root.line}）请求数据`,
+        result: result.steps[root.bornStep].note, status: 'info',
+      }));
+      const tl = messageTimelineLinks(result, reg, root);
+      idSet.add(root.id);
+      for (const c of tl.copies) idSet.add(c.id);
+      links.push(...tl.links);
+      if (!tl.firstDelivery) {
+        const lastStep = result.steps.length - 1;
+        const lastCopy = tl.copies[tl.copies.length - 1];
+        links.push(mkLink({
+          role: 'pending', step: lastStep, order: 9, msgId: lastCopy.id,
+          line: root.line, core: root.to, gen: root.gen,
+          action: `授权 M${lastCopy.id} 仍在途，尚未送达 C${root.to}`,
+          result: `L${root.line} 的授权动作未完成（回放于第 ${lastStep} 步停止）`,
+          status: 'pending',
+        }));
+      } else if (tl.links.some((l) => l.role === 'deliver' && !l.violation)) {
+        closure = { step: tl.firstDelivery.step, gen: root.gen, kind: 'grant', to: root.to };
+      }
+    }
+
+    // 其他事件引用链上消息的违约（如授权在途时的缺失拥有者数据）。
+    for (const lv of reg.linkedViolations) {
+      if (idSet.has(lv.msgId)) {
+        links.push(mkLink({
+          role: 'refuse', step: lv.step, order: 6, msgId: lv.msgId,
+          line: lv.violation.line, core: Array.isArray(lv.violation.core) ? null : lv.violation.core,
+          gen: null,
+          action: `第 ${lv.step} 步的动作引用 M${lv.msgId} 时违约`,
+          result: lv.violation.detail, status: 'bad', violation: lv.violation,
+        }));
+      }
+    }
+
+    links.sort((a, b) => (a.step - b.step) || (a.order - b.order)
+      || ((a.msgId || 0) - (b.msgId || 0)) || ((a.msgRefId || 0) - (b.msgRefId || 0))
+      || ((a.msgIds && a.msgIds[0]) || 0) - ((b.msgIds && b.msgIds[0]) || 0));
+
+    let status = 'pending';
+    let terminal = null;
+    let rejection = null;
+    const cut = links.findIndex((l) => l.status === 'bad');
+    if (cut >= 0) {
+      terminal = links[cut];
+      links.splice(cut + 1);
+      status = 'rejected';
+      rejection = terminal.violation
+        ? { kind: terminal.violation.kind, detail: terminal.violation.detail }
+        : { kind: null, detail: terminal.result };
+    } else if (closure) {
+      status = 'closed';
+    }
+
+    // 迟到/失配确认：显式给出其缺失或失配的等待关系。
+    let waiting = (() => {
+      const miss = links.filter((l) => l.role === 'pending');
+      return miss.length ? miss.map((l) => l.action).join('；') : null;
+    })();
+    if (status === 'rejected' && terminal.role === 'ack') {
+      const pd = result.steps[terminal.step].dir[terminal.line];
+      if (!pd.pending) {
+        waiting = `L${terminal.line} 目录无等待中的写入：C${terminal.core} 的世代 ${terminal.gen} 确认没有可匹配的等待关系`;
+      } else if (pd.pending.gen !== terminal.gen) {
+        waiting = `等待关系要求世代 ${pd.pending.gen}（等待集合 {${cores(pd.pending.waitAcks)}}），到达的却是世代 ${terminal.gen}：世代失配`;
+      } else if (!pd.pending.waitAcks.includes(terminal.core)) {
+        waiting = `世代 ${pd.pending.gen} 匹配，但 C${terminal.core} 不在等待集合 {${cores(pd.pending.waitAcks)}} 中`;
+      } else {
+        waiting = `C${terminal.core} 未登记世代 ${terminal.gen} 的待确认失效：等待关系存在但确认来源缺失/失配`;
+      }
+    }
+
+    return {
+      ok: true,
+      status,
+      selected: {
+        id: selected.id, kind: selected.kind, to: selected.to, line: selected.line,
+        gen: selected.gen, dupOf: selected.dupOf,
+      },
+      rootId: root.id,
+      links,
+      terminal,
+      terminalStep: terminal ? terminal.step : null,
+      rejection,
+      closure,
+      waiting,
+      notices,
+    };
+  }
+
+  // 所有曾出生的消息（含已投递/被拒/重传副本），供页面选择入口使用。
+  // state 与追溯结论保持一致：rejected=其因果链在首个违规步终止；
+  // delivered=链已闭合；in-flight=仍有未完成的投递/等待。
+  function listTraceableMessages(result) {
+    if (!result || result.ok !== true) return [];
+    const reg = buildRegistry(result);
+    const finalIds = new Set(result.steps[result.steps.length - 1].inFlight.map((m) => m.id));
+    return [...reg.byId.values()]
+      .sort((a, b) => a.id - b.id)
+      .map((r) => {
+        let state;
+        let stateStep = null;
+        const own = (reg.effects.get(r.id) || []).find((e) => e.violation);
+        if (own) {
+          state = 'rejected';
+          stateStep = own.step;
+        } else {
+          const ch = traceCausalChain(result, { msg: r.id });
+          if (ch.status === 'rejected') { state = 'rejected'; stateStep = ch.terminalStep; }
+          else if (ch.status === 'closed') { state = 'delivered'; stateStep = ch.closure.step; }
+          else state = 'in-flight';
+        }
+        return {
+          id: r.id, kind: r.kind, to: r.to, line: r.line, gen: r.gen,
+          dupOf: r.dupOf, rootId: r.rootId, bornStep: r.bornStep,
+          state, stateStep, inFlight: finalIds.has(r.id),
+        };
+      });
+  }
+
   return {
     LIMITS, VIOLATION, VIOLATION_LABELS,
     createState, simulate, checkConsistency, effectiveHolders,
+    traceCausalChain, listTraceableMessages,
   };
 });

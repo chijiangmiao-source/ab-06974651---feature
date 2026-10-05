@@ -14,9 +14,13 @@
   var worker = null;
   var runToken = 0;
   var steps = null;
+  var replayResult = null; // 当前证据（导入/草稿恢复后替换；旧 Worker 结果受令牌拦截不会覆盖）
   var eventsTotal = 0;
   var idx = 0;
   var timer = null;
+  var currentChain = null;  // 当前展示的因果链（仅派生自 replayResult）
+  var traceRef = null;      // 当前追溯入口（{msg} 或 {step}）
+  var computing = false;    // 新证据计算中：禁止用旧证据发起追溯
 
   // ---------- 示例轨迹 ----------
 
@@ -88,6 +92,7 @@
   function cancelRun(reason) {
     runToken++;
     if (worker) { worker.terminate(); worker = null; }
+    computing = false;
     stopPlay();
     if (reason) setStatus(reason);
   }
@@ -97,18 +102,30 @@
     var token = runToken;
     setStatus('计算中…');
     steps = null;
+    replayResult = null;
+    currentChain = null;
+    traceRef = null;
+    computing = true;
+    renderTraceOptions({ ok: false });
+    renderTracePanel();
     worker = new Worker('worker.js');
     worker.onmessage = function (e) {
       var msg = e.data;
       if (!msg || msg.token !== token) return; // 旧结果不得覆盖新导入内容
+      computing = false;
       if (msg.type === 'error') { setStatus('计算失败：' + msg.error); return; }
       var result = msg.result;
       if (!result.ok) { setStatus('导入被拒绝：' + result.error); return; }
+      replayResult = result;
       steps = result.steps;
       eventsTotal = result.eventsTotal;
       idx = 0;
+      currentChain = null; // 新证据到达：旧查询作废，不得覆盖当前证据
+      traceRef = null;
       renderEventList(result);
+      renderTraceOptions(result);
       renderStep();
+      renderTracePanel();
       if (result.violation) {
         setStatus('回放冻结于第 ' + result.violation.step + ' 步（首次违约）');
       } else {
@@ -164,7 +181,24 @@
     result.steps.forEach(function (s, i) {
       if (i === 0) return; // 初始状态不占事件位
       var li = document.createElement('li');
+      var traceable = s.event.type === 'deliver' || s.event.type === 'timeout' || s.event.type === 'ack';
       li.textContent = fmtEvent(s.event);
+      if (traceable) {
+        var b = document.createElement('button');
+        b.className = 'mini';
+        b.type = 'button';
+        b.textContent = '链';
+        b.title = '追溯此步骤涉及消息的因果链';
+        b.addEventListener('click', function (e) {
+          e.stopPropagation();
+          stopPlay();
+          idx = i;
+          renderStep();
+          runTrace({ step: i });
+        });
+        li.appendChild(document.createTextNode(' '));
+        li.appendChild(b);
+      }
       li.dataset.step = String(i);
       if (s.violation) li.classList.add('bad');
       li.addEventListener('click', function () { stopPlay(); idx = i; renderStep(); });
@@ -200,14 +234,24 @@
       var v = s.violation;
       var labels = (typeof Protocol !== 'undefined') ? Protocol.VIOLATION_LABELS : {};
       var label = labels[v.kind] || v.kind;
+      var jump = (v.msgId !== null && v.msgId !== undefined)
+        ? '<button type="button" class="mini traceBtn" data-trace-msg="' + v.msgId + '">追溯消息 M' + v.msgId + '</button>'
+        : '<button type="button" class="mini traceBtn" data-trace-step="' + idx + '">追溯本步等待关系</button>';
       box.innerHTML = '⛔ 首次违约冻结 — <b>' + esc(label) + '</b>'
         + (v.line !== null && v.line !== undefined ? '｜线 L' + esc(v.line) : '')
         + (v.core !== null && v.core !== undefined
           ? '｜核心 ' + (Array.isArray(v.core) ? v.core.map(function (c) { return 'C' + c; }).join(',') : 'C' + esc(v.core))
           : '')
         + (v.msgId !== null && v.msgId !== undefined ? '｜消息 M' + esc(v.msgId) : '')
+        + ' ' + jump
         + '<br>' + esc(v.detail);
       box.classList.remove('hidden');
+      box.querySelectorAll('[data-trace-msg]').forEach(function (b) {
+        b.addEventListener('click', function () { runTrace({ msg: Number(b.dataset.traceMsg) }); });
+      });
+      box.querySelectorAll('[data-trace-step]').forEach(function (b) {
+        b.addEventListener('click', function () { runTrace({ step: Number(b.dataset.traceStep) }); });
+      });
     } else {
       box.classList.add('hidden');
       box.innerHTML = '';
@@ -216,6 +260,7 @@
     renderDir(s);
     renderCaches(s);
     renderInflight(s);
+    highlightChainStep();
   }
 
   function renderDir(s) {
@@ -259,8 +304,133 @@
         ? '失效→C' + m.to + ' L' + m.line + ' g' + m.gen
         : '授权→C' + m.to + ' L' + m.line + ' ' + m.grantState + ' g' + m.gen + ' d=' + m.data;
       var dup = m.dupOf !== null ? ' <em>重传自 M' + m.dupOf + '</em>' : '';
-      return '<span class="chip ' + m.kind + '">M' + m.id + ' ' + esc(body) + dup + '</span>';
+      return '<button type="button" class="chip ' + m.kind + '" data-trace-msg="' + m.id + '" '
+        + 'title="点击追溯 M' + m.id + ' 的因果链（原始请求→投递→确认/闭合）">M' + m.id + ' '
+        + esc(body) + dup + '</button>';
     }).join(' ');
+    box.querySelectorAll('[data-trace-msg]').forEach(function (el) {
+      el.addEventListener('click', function () {
+        runTrace({ msg: Number(el.dataset.traceMsg) });
+      });
+    });
+  }
+
+  // ---------- 因果链追溯 ----------
+
+  function msgKindText(kind) { return kind === 'inv' ? '失效' : '授权'; }
+
+  function renderTraceOptions(result) {
+    var sel = $('#traceSelect');
+    var msgs = (typeof Protocol !== 'undefined' && Protocol.listTraceableMessages)
+      ? Protocol.listTraceableMessages(result) : [];
+    var html = '<option value="">— 选择消息 —</option>';
+    msgs.forEach(function (m) {
+      var tag = m.inFlight ? '在途' : (m.state === 'rejected' ? '被拒' : '已投递');
+      var label = 'M' + m.id + '·' + msgKindText(m.kind) + '→C' + m.to
+        + ' L' + m.line + ' g' + m.gen + '（' + tag + '，生于第' + m.bornStep + '步）'
+        + (m.dupOf !== null ? ' 重传自M' + m.dupOf : '');
+      html += '<option value="' + m.id + '">' + esc(label) + '</option>';
+    });
+    sel.innerHTML = html;
+    sel.value = '';
+  }
+
+  function runTrace(ref) {
+    if (computing || !replayResult || typeof Protocol === 'undefined' || !Protocol.traceCausalChain) return;
+    traceRef = ref;
+    currentChain = Protocol.traceCausalChain(replayResult, ref);
+    if (ref.msg !== undefined && ref.msg !== null) $('#traceSelect').value = String(ref.msg);
+    if (ref.step !== undefined) {
+      var ev = replayResult.steps[ref.step] && replayResult.steps[ref.step].event;
+      if (ev && (ev.type === 'deliver' || ev.type === 'timeout')) $('#traceSelect').value = String(ev.msg);
+    }
+    renderTracePanel();
+  }
+
+  function chainHead(chain) {
+    if (!chain.ok) return '追溯不可用：' + esc(chain.error || '未知错误');
+    var title;
+    if (chain.selected && chain.selected.id !== null && chain.selected.id !== undefined) {
+      title = '消息 M' + chain.selected.id
+        + (chain.selected.dupOf !== null ? '（M' + chain.selected.dupOf + ' 的重传副本，原始 M' + chain.rootId + '）' : '')
+        + ' · L' + chain.selected.line + ' · →C' + chain.selected.to + ' · 世代 ' + chain.selected.gen;
+    } else {
+      title = '无可绑定的既有消息来源';
+    }
+    var badge = chain.status === 'closed' ? '<span class="t-ok">✓ 链路闭合</span>'
+      : chain.status === 'rejected' ? '<span class="t-bad">⛔ 首违终止</span>'
+      : '<span class="t-pending">⏳ 未闭合</span>';
+    return '<div class="traceHead">' + esc(title) + ' ' + badge + '</div>';
+  }
+
+  function renderTracePanel() {
+    var panel = $('#tracePanel');
+    if (!replayResult) { panel.classList.add('hidden'); panel.innerHTML = ''; return; }
+    if (!currentChain) {
+      panel.classList.remove('hidden');
+      panel.innerHTML = '<span class="dim">选择一条消息后，在此展示从原始请求到投递/确认/闭合的有序因果链。</span>';
+      return;
+    }
+    var c = currentChain;
+    var labels = (typeof Protocol !== 'undefined') ? Protocol.VIOLATION_LABELS : {};
+    var html = chainHead(c);
+
+    (c.notices || []).forEach(function (n) {
+      html += '<div class="traceNotice">↪ ' + esc(n) + '</div>';
+    });
+
+    if (c.status === 'rejected') {
+      var rj = c.rejection || {};
+      html += '<div class="traceReject">链路终止于首个违规步骤（第 ' + c.terminalStep + ' 步）：<b>'
+        + esc(labels[rj.kind] || rj.kind || '违约') + '</b>'
+        + '<br>' + esc(rj.detail || '') + '</div>';
+      if (c.waiting) html += '<div class="traceWait">缺失/失配的等待关系：' + esc(c.waiting) + '</div>';
+    } else if (c.status === 'closed') {
+      var cl = c.closure || {};
+      html += '<div class="traceOk">' + (cl.kind === 'grant'
+        ? '授权已于第 ' + cl.step + ' 步送达 C' + cl.to + '（L' + (c.selected && c.selected.line) + '，世代 ' + cl.gen + '）。'
+        : '第 ' + cl.gen + ' 世代写入在第 ' + cl.step + ' 步合法闭合：等待集合清空，C' + cl.requester + ' 获得独占（M）。')
+        + '</div>';
+    } else if (c.waiting) {
+      html += '<div class="traceWait">⏳ ' + esc(c.waiting) + '</div>';
+    }
+
+    html += '<table class="grid traceTable"><thead><tr>'
+      + '<th>#</th><th>事件序号</th><th>消息号</th><th>缓存线</th><th>核心</th><th>世代</th>'
+      + '<th>动作</th><th>动作结果</th></tr></thead><tbody>';
+    c.links.forEach(function (l, i) {
+      var mid = l.msgId !== null ? 'M' + l.msgId
+        : (l.msgIds ? l.msgIds.map(function (x) { return 'M' + x; }).join(',')
+          : (l.msgRefId !== null ? '→M' + l.msgRefId : '—'));
+      html += '<tr class="trow-' + l.status + (l.role === 'origin' ? ' trace-origin' : '')
+        + (l.violation ? ' trace-viol' : '') + '" data-jump-step="' + l.step + '">'
+        + '<td>' + (i + 1) + '</td>'
+        + '<td class="num">第 ' + l.step + ' 步</td>'
+        + '<td class="num">' + esc(mid) + '</td>'
+        + '<td>' + (l.line === null ? '—' : 'L' + l.line) + '</td>'
+        + '<td>' + (l.core === null ? '—' : 'C' + l.core) + '</td>'
+        + '<td>' + (l.gen === null ? '—' : 'g' + l.gen) + '</td>'
+        + '<td>' + esc(l.action) + '</td>'
+        + '<td>' + esc(l.result) + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    panel.innerHTML = html;
+    panel.classList.remove('hidden');
+    panel.querySelectorAll('[data-jump-step]').forEach(function (tr) {
+      tr.addEventListener('click', function () {
+        stopPlay();
+        stepTo(Number(tr.dataset.jumpStep));
+      });
+    });
+    highlightChainStep();
+  }
+
+  function highlightChainStep() {
+    var panel = $('#tracePanel');
+    if (!panel || !currentChain) return;
+    panel.querySelectorAll('[data-jump-step]').forEach(function (tr) {
+      tr.classList.toggle('trace-current', Number(tr.dataset.jumpStep) === idx);
+    });
   }
 
   // ---------- 回放控制 ----------
@@ -276,11 +446,20 @@
     document.querySelectorAll('[data-sample]').forEach(function (b) {
       b.addEventListener('click', function () { loadSample(b.dataset.sample); });
     });
+    $('#btnTrace').addEventListener('click', function () {
+      var v = $('#traceSelect').value;
+      if (v !== '') runTrace({ msg: Number(v) });
+    });
+    $('#traceSelect').addEventListener('change', function () {
+      if (this.value !== '') runTrace({ msg: Number(this.value) });
+    });
     $('#btnClearDraft').addEventListener('click', function () {
       try { localStorage.removeItem(DRAFT_KEY); } catch (e) { /* ignore */ }
       $('#jsonInput').value = '';
       cancelRun('本地草稿已清除');
-      steps = null; $('#eventList').innerHTML = ''; renderEmptyTables(); setStepInfo();
+      steps = null; replayResult = null; currentChain = null; traceRef = null;
+      $('#eventList').innerHTML = ''; renderEmptyTables(); setStepInfo();
+      renderTraceOptions({ ok: false }); $('#tracePanel').classList.add('hidden'); $('#tracePanel').innerHTML = '';
     });
     $('#btnPrev').addEventListener('click', function () { stopPlay(); stepTo(idx - 1); });
     $('#btnNext').addEventListener('click', function () { stopPlay(); stepTo(idx + 1); });
@@ -295,7 +474,9 @@
     $('#btnPause').addEventListener('click', stopPlay);
     $('#btnCancel').addEventListener('click', function () {
       cancelRun('已取消：旧结果不会覆盖当前内容');
-      steps = null; $('#eventList').innerHTML = ''; renderEmptyTables(); setStepInfo();
+      steps = null; replayResult = null; currentChain = null; traceRef = null;
+      $('#eventList').innerHTML = ''; renderEmptyTables(); setStepInfo();
+      renderTraceOptions({ ok: false }); $('#tracePanel').classList.add('hidden'); $('#tracePanel').innerHTML = '';
     });
   }
 
